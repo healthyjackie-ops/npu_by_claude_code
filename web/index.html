@@ -20,10 +20,14 @@
   .row{margin:10px 0;cursor:help}
   .row .top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
   .row label{color:var(--mut);font-size:12px;line-height:1.3}
-  .qm{display:inline-block;width:13px;height:13px;line-height:13px;text-align:center;
-      border-radius:50%;background:var(--line);color:var(--mut);font-size:9px;vertical-align:1px}
-  [title]{cursor:help}
+  .qm{display:inline-block;width:14px;height:14px;line-height:14px;text-align:center;
+      border-radius:50%;background:var(--acc);color:#fff;font-size:9px;font-weight:700;vertical-align:1px;cursor:help}
+  [data-tip]{cursor:help}
   .card{cursor:help} .panel h2{cursor:help}
+  #tip{position:fixed;z-index:9999;max-width:300px;background:var(--panel);border:1px solid var(--acc);
+       border-radius:8px;padding:9px 11px;font-size:12px;line-height:1.55;color:var(--txt);
+       box-shadow:0 8px 28px rgba(0,0,0,.55);pointer-events:none;opacity:0;transition:opacity .07s;visibility:hidden}
+  #tip.on{opacity:1;visibility:visible} #tip b{color:var(--acc);font-weight:700}
   .rl-roof{stroke-width:2;fill:none} .rl-pt{stroke:#0b0d11;stroke-width:.5}
   .rl-ax{stroke:var(--line);stroke-width:1} .rl-txt{fill:var(--mut);font-size:10px}
   .rl-lbl{fill:var(--txt);font-size:11px}
@@ -42,7 +46,7 @@
   .bar{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:12px}
   .bar .nm{flex:0 0 90px;color:var(--mut)}
   .bar .tr{flex:1;height:16px;background:var(--panel2);border-radius:4px;overflow:hidden}
-  .bar .fl{height:100%;border-radius:4px}
+  .bar .fl{display:block;height:100%;min-width:2px;border-radius:4px}
   .bar .lb{flex:0 0 86px;text-align:right;font-variant-numeric:tabular-nums}
   table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
   th,td{text-align:right;padding:4px 8px;border-bottom:1px solid var(--line)}
@@ -64,17 +68,17 @@
   <div class="controls" id="controls"></div>
   <div class="main">
     <div class="cards" id="cards"></div>
-    <div class="panel"><h2 title="这颗 NPU 的组件与数据流。每个方块标注了它由哪些控件(旋钮)决定,方块里的数字随左侧滑块实时更新。">NPU 组件架构 — 控件 ↔ 部件对应(数字随滑块变) <span class="qm">?</span></h2>
+    <div class="panel"><h2 data-tip="这颗 NPU 的组件与数据流。每个方块标注了它由哪些控件(旋钮)决定,方块里的数字随左侧滑块实时更新。">NPU 组件架构 — 控件 ↔ 部件对应(数字随滑块变) <span class="qm">?</span></h2>
       <div id="arch"></div>
       <div class="note">数据流:DRAM →(DMA/KV 引擎)→ 片上 SRAM →{Tensor 脉动阵列 / 向量单元}。<b style="color:#5b8cff">蓝路径</b>=算力受限(ViT/prefill 的大矩阵乘走 Tensor 阵列);<b style="color:#e2655a">红路径</b>=带宽受限(decode 每 token 要从 DRAM 流过约 2.6GB 权重喂向量单元)。每个方块下方灰字标的就是控制它的滑块。</div></div>
-    <div class="panel"><h2 title="经典 roofline:横轴=算术强度(每从 DRAM 读 1 字节能做多少次乘加),纵轴=可达算力。算子落在斜线上=被带宽卡,落在水平线上=被算力卡。">Roofline 图 — 每个算子卡在算力还是带宽? <span class="qm">?</span></h2>
+    <div class="panel"><h2 data-tip="经典 roofline:横轴=算术强度(每从 DRAM 读 1 字节能做多少次乘加),纵轴=可达算力。算子落在斜线上=被带宽卡,落在水平线上=被算力卡。">Roofline 图 — 每个算子卡在算力还是带宽? <span class="qm">?</span></h2>
       <div id="roofline"></div>
       <div class="note">斜线 = DRAM 带宽屋顶;水平线 = 算力屋顶(阵列/向量)。点越靠左下=越被带宽卡(decode);越靠右=被算力卡(prefill/视觉)。颜色按阶段。</div></div>
-    <div class="panel"><h2>各阶段延迟 (单次执行 × 重复次数)</h2><div id="stages"></div></div>
-    <div class="panel"><h2>瓶颈 (op-time 按 binding roof 分布)</h2><div id="roofs"></div>
+    <div class="panel"><h2 data-tip="一次完整控制步里,各阶段花的时间。条长=该阶段总耗时(单次×重复次数)。decode 因为要逐 token 跑很多次,通常最长。">各阶段延迟 (单次执行 × 重复次数) <span class="qm">?</span></h2><div id="stages"></div></div>
+    <div class="panel"><h2 data-tip="把所有算子的耗时按‘卡在哪条屋顶’归类:compute=被算力卡(阵列/向量算不过来),dram=被外部带宽卡(等着从 DRAM 搬权重),onchip=被片上 SRAM 带宽卡,sfu=被激活/归一化等特殊函数单元卡。占比最大的就是优化重点。">瓶颈 (op-time 按 binding roof 分布) <span class="qm">?</span></h2><div id="roofs"></div>
       <div class="note" id="roofnote"></div></div>
-    <div class="panel"><h2>每 token 能耗构成</h2><div id="energy"></div></div>
-    <div class="panel"><h2>算子级仿真过程 (<span id="opcount"></span> ops)</h2>
+    <div class="panel"><h2 data-tip="生成一个 token 的能量去哪了。**decode 几乎全花在从 DRAM 搬权重上**(红),片上 SRAM 读写(绿)和实际乘加 MAC(蓝)占比很小——这正是 decode 被带宽卡的能量侧证据。">每 token 能耗构成 <span class="qm">?</span></h2><div id="energy"></div></div>
+    <div class="panel"><h2 data-tip="逐算子的明细表:每行一个算子(M×N×K 矩阵规模、MAC 数、要搬的权重、单次耗时×重复次数、以及它被哪条屋顶卡住)。这就是上面所有图表的原始数据。">算子级仿真过程 (<span id="opcount"></span> ops) <span class="qm">?</span></h2>
       <div class="tblwrap"><table id="optbl"><thead><tr>
         <th>op</th><th>stage</th><th>type</th><th>M</th><th>N</th><th>K</th>
         <th>MACs(M)</th><th>权重(MB)</th><th>ms×n</th><th>roof</th></tr></thead>
@@ -135,16 +139,16 @@ function curFlow(){ return wl.__flow!=null ? wl.__flow : cfg.flow_expert_steps; 
 
 function buildControls(){
   const c = document.getElementById("controls");
-  let h = `<div class="grp"><h3>输入模型</h3><select id="model" title="选择要在这颗 NPU 上跑的 VLA 模型;不同规模的算子图(层数/隐藏维/词表)差别很大。">` +
+  let h = `<div class="grp"><h3>输入模型</h3><select id="model" data-tip="选择要在这颗 NPU 上跑的 VLA 模型;不同规模的算子图(层数/隐藏维/词表)差别很大。">` +
     Object.entries(N.MODELS).map(([k,m])=>`<option value="${k}"${k==modelKey?" selected":""}>${m.label}</option>`).join("") +
     `</select></div>`;
   for (const [grp, items] of Object.entries(KNOBS)){
     h += `<div class="grp"><h3>${grp}</h3>`;
     for (const [key,label,[mn,mx,st],tip] of items){
       const v = key.startsWith("__") ? (wl[key]!=null?wl[key]:defWL(key)) : cfg[key];
-      h += `<div class="row" title="${tip||""}">
+      h += `<div class="row" data-tip="${tip||""}">
         <div class="top"><label>${label} <span class="qm">?</span></label><span class="val" id="v_${key}">${fmt(v)}</span></div>
-        <input type="range" data-k="${key}" min="${mn}" max="${mx}" step="${st}" value="${v}" title="${tip||""}"></div>`;
+        <input type="range" data-k="${key}" min="${mn}" max="${mx}" step="${st}" value="${v}" data-tip="${tip||""}"></div>`;
     }
     h += `</div>`;
   }
@@ -285,7 +289,7 @@ function recompute(){
     ["可行",feas?"✓":"✗","≥10Hz·≤30W·≤60mm²",feas?"pass":"fail"],
   ];
   document.getElementById("cards").innerHTML = cards.map(([k,v,u,cl])=>
-    `<div class="card ${cl}" title="${CARD_TIPS[k]||''}"><div class="k">${k}</div><div class="v">${v}</div><div class="u">${u}</div></div>`).join("");
+    `<div class="card ${cl}" data-tip="${CARD_TIPS[k]||''}"><div class="k">${k}</div><div class="v">${v}</div><div class="u">${u}</div></div>`).join("");
   drawArch(cfg, r);
   drawRoofline(r, cfg);
   // stages
@@ -323,6 +327,27 @@ function recompute(){
       <td><span class="tag b-${o.bound}">${o.bound}</span></td></tr>`;
   }).join("");
 }
+// ---- custom hover tooltip (instant, reliable; replaces laggy native title) ----
+(function(){
+  const tip=document.createElement("div"); tip.id="tip"; document.body.appendChild(tip);
+  const md=s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/\*\*(.+?)\*\*/g,"<b>$1</b>");
+  let cur=null;
+  function place(e){
+    let x=e.clientX+15, y=e.clientY+18;
+    const w=tip.offsetWidth, h=tip.offsetHeight;
+    if(x+w>innerWidth-8)  x=Math.max(8, e.clientX-w-15);
+    if(y+h>innerHeight-8) y=Math.max(8, e.clientY-h-18);
+    tip.style.left=x+"px"; tip.style.top=y+"px";
+  }
+  document.addEventListener("mouseover",e=>{
+    const el=e.target.closest && e.target.closest("[data-tip]");
+    if(el && el.getAttribute("data-tip")){
+      cur=el; tip.innerHTML=md(el.getAttribute("data-tip")); tip.classList.add("on"); place(e);
+    } else if(cur){ tip.classList.remove("on"); cur=null; }
+  });
+  document.addEventListener("mousemove",e=>{ if(cur) place(e); });
+  document.addEventListener("mouseleave",()=>{ tip.classList.remove("on"); cur=null; });
+})();
 buildControls(); recompute();
 </script>
 </body>
