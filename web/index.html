@@ -18,7 +18,15 @@
   .grp{margin-bottom:18px}
   .grp h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 8px;font-weight:600}
   .row{display:flex;align-items:center;gap:8px;margin:7px 0}
+  .row{cursor:help}
   .row label{flex:0 0 116px;color:var(--mut);font-size:12px}
+  .qm{display:inline-block;width:13px;height:13px;line-height:13px;text-align:center;
+      border-radius:50%;background:var(--line);color:var(--mut);font-size:9px;vertical-align:1px}
+  [title]{cursor:help}
+  .card{cursor:help} .panel h2{cursor:help}
+  .rl-roof{stroke-width:2;fill:none} .rl-pt{stroke:#0b0d11;stroke-width:.5}
+  .rl-ax{stroke:var(--line);stroke-width:1} .rl-txt{fill:var(--mut);font-size:10px}
+  .rl-lbl{fill:var(--txt);font-size:11px}
   .row input[type=range]{flex:1;accent-color:var(--acc)}
   .row .val{flex:0 0 58px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
   select,input[type=number]{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
@@ -56,6 +64,9 @@
   <div class="controls" id="controls"></div>
   <div class="main">
     <div class="cards" id="cards"></div>
+    <div class="panel"><h2 title="经典 roofline:横轴=算术强度(每从 DRAM 读 1 字节能做多少次乘加),纵轴=可达算力。算子落在斜线上=被带宽卡,落在水平线上=被算力卡。">Roofline 图 — 每个算子卡在算力还是带宽? <span class="qm">?</span></h2>
+      <div id="roofline"></div>
+      <div class="note">斜线 = DRAM 带宽屋顶;水平线 = 算力屋顶(阵列/向量)。点越靠左下=越被带宽卡(decode);越靠右=被算力卡(prefill/视觉)。颜色按阶段。</div></div>
     <div class="panel"><h2>各阶段延迟 (单次执行 × 重复次数)</h2><div id="stages"></div></div>
     <div class="panel"><h2>瓶颈 (op-time 按 binding roof 分布)</h2><div id="roofs"></div>
       <div class="note" id="roofnote"></div></div>
@@ -72,30 +83,40 @@
 <script src="npusim_model.js"></script>
 <script>
 const N = window.NPUSim;
-// which config knobs to expose, with [min,max,step]
+// which config knobs to expose, with [min,max,step,tooltip]
 const KNOBS = {
-  "Tensor core": [
-    ["tensor_array_dim","阵列边 N",[64,256,16]],
-    ["tensor_clock_ghz","时钟 GHz",[0.7,1.4,0.1]],
-    ["util_gemm","GEMM 利用率",[0.6,0.95,0.05]],
+  "Tensor core (算 GEMM 的脉动阵列)": [
+    ["tensor_array_dim","阵列边 N",[64,256,16],"脉动阵列每边的乘加单元数,总算力≈N×N。大→视觉/prefill 这类大矩阵更快,但面积按 N² 涨。"],
+    ["tensor_clock_ghz","时钟 GHz",[0.7,1.4,0.1],"阵列主频。算力随频率线性涨,但功耗也涨;0.7V 工艺约 1GHz 是甜点。"],
+    ["util_gemm","GEMM 利用率",[0.6,0.95,0.05],"大矩阵乘的实际利用率(扣掉流水填充/小块浪费后)。0.85 是较现实的值。"],
   ],
-  "Vector / decode": [
-    ["vector_lanes","向量 lane",[256,1024,128]],
-    ["vector_dot_len","dot 长",[1,8,1]],
-    ["decode_batch","decode batch",[1,8,1]],
+  "Vector / decode (算 GEMV 的向量单元)": [
+    ["vector_lanes","向量 lane 数",[256,1024,128],"向量单元的并行通道数,负责自回归 decode 的 GEMV。decode 受带宽卡,所以它便宜且够用。"],
+    ["vector_dot_len","每 lane 点积长",[1,8,1],"每个 lane 每拍做几次乘加。与 lane 数共同决定向量算力。"],
+    ["decode_batch","decode 并行样本数",[1,8,1],"同时跑几路动作采样,共享一次权重读取。↑能摊薄权重带宽(能耗/token 下降),但单机器人单动作通常=1。"],
   ],
-  "Memory & DRAM": [
-    ["scratchpad_kb","SRAM KB",[2048,8192,1024]],
-    ["dram_bw_gbps","DRAM GB/s",[68,683,17]],
-    ["dram_bw_util_decode","BW 利用率",[0.6,0.95,0.05]],
-    ["kv_quant_bits","KV bits",[4,8,4]],
-    ["resident_weight_frac","常驻权重比",[0,0.3,0.05]],
+  "Memory & DRAM (内存与外部带宽)": [
+    ["scratchpad_kb","片上 SRAM (KB)",[2048,8192,1024],"片上暂存:放视觉激活、prefill 权重块、KV cache 窗口。越大越能少读 DRAM,但面积贵。"],
+    ["dram_bw_gbps","DRAM 带宽 GB/s",[68,683,17],"外部内存带宽(LPDDR5X)。**decode 的头号瓶颈**——每 token 要从 DRAM 流过约 2.6GB 权重。"],
+    ["dram_bw_util_decode","DRAM 带宽利用率",[0.6,0.95,0.05],"实际能吃到的带宽占峰值的比例(受 DMA 双缓冲/突发效率限制)。"],
+    ["kv_quant_bits","KV cache 位宽",[4,8,4],"KV cache 量化位数。4bit 比 8bit 省一半 KV 带宽/容量,长上下文 decode 关键。"],
+    ["resident_weight_frac","常驻权重比例",[0,0.3,0.05],"把最热的权重(如 lm_head)钉在片上不反复读 DRAM 的比例。↑省 decode 带宽。"],
   ],
-  "Workload": [
-    ["__ndec","decode tokens",[1,32,1]],
-    ["__seq","KV 序列长",[256,2048,64]],
-    ["__flow","flow 步数",[1,20,1]],
+  "Workload (跑什么负载)": [
+    ["__ndec","decode token 数",[1,32,1],"一次控制要自回归生成多少个 token。**最大杠杆**:越少越快;flow 动作专家几乎不解码,自回归动作 token 则多。"],
+    ["__seq","KV 序列长度",[256,2048,64],"decode 时注意力要读的上下文长度(图像+文本+已生成)。越长 KV 读取越多。"],
+    ["__flow","flow 专家步数",[1,20,1],"扩散/flow 动作专家迭代几步。步数×每步耗时 = 动作头总延迟。"],
   ],
+};
+const CARD_TIPS = {
+  "控制频率":"每秒能完成多少次完整推理(看一帧→出一组动作)。机器人实时控制要 ≥10Hz。",
+  "端到端":"一次控制步的总延迟 = 视觉编码 + prefill + decode×token数 + 动作头。",
+  "decode":"自回归每个 token 的耗时与吞吐;decode 几乎总是被 DRAM 带宽卡住。",
+  "面积":"芯片面积(mm²):阵列 + 向量 + SRAM + 开销。越大越贵。",
+  "功耗 avg/peak":"平均功耗(被等内存的空闲拉低) / 峰值功耗(prefill 突发)。要 ≤30W 包络。",
+  "能耗/tok":"每生成一个 token 的能量(mJ),decode 由 DRAM 搬权重主导。",
+  "峰值":"阵列理论峰值算力(INT8 TOPS),实际达不到(受利用率/带宽)。",
+  "可行":"是否同时满足 ≥10Hz、≤30W、≤60mm²。",
 };
 const cfg = Object.assign({}, N.BASELINE);
 let modelKey = "vla_3b";
@@ -111,15 +132,15 @@ function curFlow(){ return wl.__flow!=null ? wl.__flow : cfg.flow_expert_steps; 
 
 function buildControls(){
   const c = document.getElementById("controls");
-  let h = `<div class="grp"><h3>输入模型</h3><select id="model">` +
+  let h = `<div class="grp"><h3>输入模型</h3><select id="model" title="选择要在这颗 NPU 上跑的 VLA 模型;不同规模的算子图(层数/隐藏维/词表)差别很大。">` +
     Object.entries(N.MODELS).map(([k,m])=>`<option value="${k}"${k==modelKey?" selected":""}>${m.label}</option>`).join("") +
     `</select></div>`;
   for (const [grp, items] of Object.entries(KNOBS)){
     h += `<div class="grp"><h3>${grp}</h3>`;
-    for (const [key,label,[mn,mx,st]] of items){
+    for (const [key,label,[mn,mx,st],tip] of items){
       const v = key.startsWith("__") ? (wl[key]!=null?wl[key]:defWL(key)) : cfg[key];
-      h += `<div class="row"><label>${label}</label>
-        <input type="range" data-k="${key}" min="${mn}" max="${mx}" step="${st}" value="${v}">
+      h += `<div class="row" title="${tip||""}"><label>${label} <span class="qm">?</span></label>
+        <input type="range" data-k="${key}" min="${mn}" max="${mx}" step="${st}" value="${v}" title="${tip||""}">
         <span class="val" id="v_${key}">${fmt(v)}</span></div>`;
     }
     h += `</div>`;
@@ -141,6 +162,53 @@ function fmt(v){ return (v%1===0)?v:(+v).toFixed(2); }
 const STAGE_COLORS={vit:"#8b7ff0",connector:"#5b8cff",prefill:"#2fbf8f",decode:"#e2655a",action:"#e0a83e"};
 const ROOF_COLORS={compute:"#5b8cff",dram:"#e2655a",onchip:"#e0a83e",sfu:"#2fbf8f"};
 
+function drawRoofline(r, c){
+  const W=560, H=300, ml=52, mr=120, mt=14, mb=34;
+  const tPeak = c.tensor_array_dim*c.tensor_array_dim*c.tensor_clock_ghz;   // GMAC/s
+  const vPeak = c.vector_lanes*c.vector_dot_len*c.vector_clock_ghz;
+  const bw = c.dram_bw_gbps*c.dram_bw_util_decode;     // GMAC/s per (MAC/byte)
+  const xmin=0.03, xmax=4000, ymin=1, ymax=tPeak*1.6;
+  const L=x=>Math.log10(x);
+  const px=I=>ml+(L(Math.min(Math.max(I,xmin),xmax))-L(xmin))/(L(xmax)-L(xmin))*(W-ml-mr);
+  const py=P=>mt+(L(ymax)-L(Math.min(Math.max(P,ymin),ymax)))/(L(ymax)-L(ymin))*(H-mt-mb);
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:620px">`;
+  // axes box + decade gridlines
+  s+=`<rect x="${ml}" y="${mt}" width="${W-ml-mr}" height="${H-mt-mb}" fill="none" class="rl-ax"/>`;
+  for(let e=-1;e<=3;e++){const x=Math.pow(10,e); if(x<xmin||x>xmax)continue;
+    s+=`<line x1="${px(x)}" y1="${mt}" x2="${px(x)}" y2="${H-mb}" class="rl-ax" opacity=".35"/>`;
+    s+=`<text x="${px(x)}" y="${H-mb+13}" text-anchor="middle" class="rl-txt">${x>=1?x:x}</text>`;}
+  for(let e=0;e<=5;e++){const y=Math.pow(10,e); if(y<ymin||y>ymax)continue;
+    s+=`<line x1="${ml}" y1="${py(y)}" x2="${W-mr}" y2="${py(y)}" class="rl-ax" opacity=".35"/>`;
+    s+=`<text x="${ml-5}" y="${py(y)+3}" text-anchor="end" class="rl-txt">${y>=1000?(y/1000)+'T':y+'G'}</text>`;}
+  s+=`<text x="${(ml+W-mr)/2}" y="${H-3}" text-anchor="middle" class="rl-txt">算术强度  MAC / 从DRAM读的字节</text>`;
+  s+=`<text x="12" y="${(mt+H-mb)/2}" text-anchor="middle" class="rl-txt" transform="rotate(-90 12 ${(mt+H-mb)/2})">可达算力 GMAC/s</text>`;
+  // DRAM bandwidth roof (diagonal, slope 1 in log-log), clipped at tPeak
+  const Iridge=tPeak/bw;
+  s+=`<line x1="${px(xmin)}" y1="${py(bw*xmin)}" x2="${px(Iridge)}" y2="${py(tPeak)}" class="rl-roof" stroke="#e2655a"/>`;
+  // compute roofs
+  s+=`<line x1="${px(Iridge)}" y1="${py(tPeak)}" x2="${W-mr}" y2="${py(tPeak)}" class="rl-roof" stroke="#5b8cff"/>`;
+  s+=`<line x1="${ml}" y1="${py(vPeak)}" x2="${W-mr}" y2="${py(vPeak)}" class="rl-roof" stroke="#2fbf8f" stroke-dasharray="5 4"/>`;
+  s+=`<text x="${W-mr+4}" y="${py(tPeak)+3}" class="rl-lbl" fill="#5b8cff">阵列 ${tPeak>=1000?(tPeak/1000).toFixed(1)+'T':tPeak.toFixed(0)+'G'}</text>`;
+  s+=`<text x="${W-mr+4}" y="${py(vPeak)+3}" class="rl-lbl" fill="#2fbf8f">向量 ${vPeak>=1000?(vPeak/1000).toFixed(1)+'T':vPeak.toFixed(0)+'G'}</text>`;
+  s+=`<text x="${px(Iridge)}" y="${py(tPeak)-5}" text-anchor="middle" class="rl-txt" fill="#e2655a">DRAM 带宽屋顶</text>`;
+  // operator points
+  for(const o of r.per_op){
+    if(o.macs<=0) continue;
+    const I = o.dram_bytes>0 ? o.macs/o.dram_bytes : xmax;   // no DRAM => compute side
+    const P = (o.macs/o.time_s)/1e9;                          // GMAC/s achieved
+    const col = STAGE_COLORS[o.stage]||"#888";
+    s+=`<circle cx="${px(I).toFixed(1)}" cy="${py(P).toFixed(1)}" r="3.2" fill="${col}" class="rl-pt"><title>${o.op_id} (${o.stage}) — 强度 ${I.toFixed(2)} MAC/B, 达 ${P.toFixed(0)} GMAC/s, 卡在 ${o.bound}</title></circle>`;
+  }
+  // stage legend
+  let lx=ml+6, ly=mt+12;
+  for(const [st,col] of Object.entries(STAGE_COLORS)){
+    s+=`<circle cx="${lx}" cy="${ly}" r="3.2" fill="${col}"/><text x="${lx+7}" y="${ly+3}" class="rl-txt">${st}</text>`;
+    lx+=Math.max(54, st.length*7+22);
+  }
+  s+=`</svg>`;
+  document.getElementById("roofline").innerHTML=s;
+}
+
 function recompute(){
   const d=curDims();
   const {ops,mult}=N.buildVLA(d, cfg.kv_quant_bits, curFlow(), cfg.decode_batch);
@@ -158,7 +226,8 @@ function recompute(){
     ["可行",feas?"✓":"✗","≥10Hz·≤30W·≤60mm²",feas?"pass":"fail"],
   ];
   document.getElementById("cards").innerHTML = cards.map(([k,v,u,cl])=>
-    `<div class="card ${cl}"><div class="k">${k}</div><div class="v">${v}</div><div class="u">${u}</div></div>`).join("");
+    `<div class="card ${cl}" title="${CARD_TIPS[k]||''}"><div class="k">${k}</div><div class="v">${v}</div><div class="u">${u}</div></div>`).join("");
+  drawRoofline(r, cfg);
   // stages
   const stageTotal={}, order=["vit","connector","prefill","decode","action"];
   let e2e=0; for(const s of order){ if(s in r.stage_time_ms){ stageTotal[s]=r.stage_time_ms[s]*(mult[s]||1); e2e+=stageTotal[s]; } }
