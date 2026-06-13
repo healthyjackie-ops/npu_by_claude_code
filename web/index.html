@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>npusim — NPU-for-VLA web simulator</title>
+<style>
+  :root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--line:#2a2f3a;--txt:#e6e8ec;
+        --mut:#9aa3b2;--acc:#5b8cff;--ok:#2fbf8f;--warn:#e0a83e;--bad:#e2655a;--purple:#8b7ff0;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 -apple-system,system-ui,"PingFang SC",sans-serif}
+  header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  header h1{font-size:17px;font-weight:600;margin:0}
+  header .sub{color:var(--mut);font-size:12px}
+  .wrap{display:grid;grid-template-columns:330px 1fr;gap:0;min-height:calc(100vh - 52px)}
+  .controls{padding:16px 18px;border-right:1px solid var(--line);overflow:auto}
+  .main{padding:16px 20px;overflow:auto}
+  .grp{margin-bottom:18px}
+  .grp h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 8px;font-weight:600}
+  .row{display:flex;align-items:center;gap:8px;margin:7px 0}
+  .row label{flex:0 0 116px;color:var(--mut);font-size:12px}
+  .row input[type=range]{flex:1;accent-color:var(--acc)}
+  .row .val{flex:0 0 58px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+  select,input[type=number]{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+        border-radius:6px;padding:6px 8px;font:inherit;width:100%}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+  .card .k{color:var(--mut);font-size:11px}
+  .card .v{font-size:21px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+  .card .u{color:var(--mut);font-size:11px}
+  .card.hz .v{color:var(--acc)} .card.pass .v{color:var(--ok)} .card.fail .v{color:var(--warn)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:16px}
+  .panel h2{font-size:13px;margin:0 0 12px;font-weight:600;color:var(--txt)}
+  .bar{display:flex;align-items:center;gap:8px;margin:5px 0;font-size:12px}
+  .bar .nm{flex:0 0 90px;color:var(--mut)}
+  .bar .tr{flex:1;height:16px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .bar .fl{height:100%;border-radius:4px}
+  .bar .lb{flex:0 0 86px;text-align:right;font-variant-numeric:tabular-nums}
+  table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+  th,td{text-align:right;padding:4px 8px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--mut);font-weight:500;position:sticky;top:0;background:var(--panel)}
+  .tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px}
+  .b-compute{background:#26324d;color:#9cc0ff} .b-dram{background:#4a2a26;color:#f0a99c}
+  .b-onchip{background:#3a3320;color:#e8cf8e} .b-sfu{background:#2a3a30;color:#9fe1c0}
+  .tblwrap{max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+  .note{color:var(--mut);font-size:11px;margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>npusim</h1>
+  <span class="sub">NPU-for-VLA roofline simulator · 浏览器内实时 · 模型与 roofline.py 逐数吻合</span>
+</header>
+<div class="wrap">
+  <div class="controls" id="controls"></div>
+  <div class="main">
+    <div class="cards" id="cards"></div>
+    <div class="panel"><h2>各阶段延迟 (单次执行 × 重复次数)</h2><div id="stages"></div></div>
+    <div class="panel"><h2>瓶颈 (op-time 按 binding roof 分布)</h2><div id="roofs"></div>
+      <div class="note" id="roofnote"></div></div>
+    <div class="panel"><h2>每 token 能耗构成</h2><div id="energy"></div></div>
+    <div class="panel"><h2>算子级仿真过程 (<span id="opcount"></span> ops)</h2>
+      <div class="tblwrap"><table id="optbl"><thead><tr>
+        <th>op</th><th>stage</th><th>type</th><th>M</th><th>N</th><th>K</th>
+        <th>MACs(M)</th><th>权重(MB)</th><th>ms×n</th><th>roof</th></tr></thead>
+        <tbody id="optbody"></tbody></table></div>
+      <div class="note">每行是一个算子实例;ms×n = 单实例时间 × 阶段重复。roof 标签即该算子被哪条屋顶卡住。</div>
+    </div>
+  </div>
+</div>
+<script src="npusim_model.js"></script>
+<script>
+const N = window.NPUSim;
+// which config knobs to expose, with [min,max,step]
+const KNOBS = {
+  "Tensor core": [
+    ["tensor_array_dim","阵列边 N",[64,256,16]],
+    ["tensor_clock_ghz","时钟 GHz",[0.7,1.4,0.1]],
+    ["util_gemm","GEMM 利用率",[0.6,0.95,0.05]],
+  ],
+  "Vector / decode": [
+    ["vector_lanes","向量 lane",[256,1024,128]],
+    ["vector_dot_len","dot 长",[1,8,1]],
+    ["decode_batch","decode batch",[1,8,1]],
+  ],
+  "Memory & DRAM": [
+    ["scratchpad_kb","SRAM KB",[2048,8192,1024]],
+    ["dram_bw_gbps","DRAM GB/s",[68,683,17]],
+    ["dram_bw_util_decode","BW 利用率",[0.6,0.95,0.05]],
+    ["kv_quant_bits","KV bits",[4,8,4]],
+    ["resident_weight_frac","常驻权重比",[0,0.3,0.05]],
+  ],
+  "Workload": [
+    ["__ndec","decode tokens",[1,32,1]],
+    ["__seq","KV 序列长",[256,2048,64]],
+    ["__flow","flow 步数",[1,20,1]],
+  ],
+};
+const cfg = Object.assign({}, N.BASELINE);
+let modelKey = "vla_3b";
+let wl = { __ndec: null, __seq: null, __flow: null };
+
+function curDims(){
+  const d = Object.assign({}, N.MODELS[modelKey]);
+  if (wl.__ndec!=null) d.n_decode_tokens = wl.__ndec;
+  if (wl.__seq!=null)  d.seq_len = wl.__seq;
+  return d;
+}
+function curFlow(){ return wl.__flow!=null ? wl.__flow : cfg.flow_expert_steps; }
+
+function buildControls(){
+  const c = document.getElementById("controls");
+  let h = `<div class="grp"><h3>输入模型</h3><select id="model">` +
+    Object.entries(N.MODELS).map(([k,m])=>`<option value="${k}"${k==modelKey?" selected":""}>${m.label}</option>`).join("") +
+    `</select></div>`;
+  for (const [grp, items] of Object.entries(KNOBS)){
+    h += `<div class="grp"><h3>${grp}</h3>`;
+    for (const [key,label,[mn,mx,st]] of items){
+      const v = key.startsWith("__") ? (wl[key]!=null?wl[key]:defWL(key)) : cfg[key];
+      h += `<div class="row"><label>${label}</label>
+        <input type="range" data-k="${key}" min="${mn}" max="${mx}" step="${st}" value="${v}">
+        <span class="val" id="v_${key}">${fmt(v)}</span></div>`;
+    }
+    h += `</div>`;
+  }
+  c.innerHTML = h;
+  document.getElementById("model").onchange = e=>{ modelKey=e.target.value; wl={__ndec:null,__seq:null,__flow:null}; buildControls(); recompute(); };
+  c.querySelectorAll("input[type=range]").forEach(inp=>{
+    inp.oninput = e=>{
+      const k=e.target.dataset.k, val=parseFloat(e.target.value);
+      if (k.startsWith("__")) wl[k]=val; else cfg[k]=val;
+      document.getElementById("v_"+k).textContent=fmt(val);
+      recompute();
+    };
+  });
+}
+function defWL(k){ const d=N.MODELS[modelKey]; return k=="__ndec"?d.n_decode_tokens:k=="__seq"?d.seq_len:cfg.flow_expert_steps; }
+function fmt(v){ return (v%1===0)?v:(+v).toFixed(2); }
+
+const STAGE_COLORS={vit:"#8b7ff0",connector:"#5b8cff",prefill:"#2fbf8f",decode:"#e2655a",action:"#e0a83e"};
+const ROOF_COLORS={compute:"#5b8cff",dram:"#e2655a",onchip:"#e0a83e",sfu:"#2fbf8f"};
+
+function recompute(){
+  const d=curDims();
+  const {ops,mult}=N.buildVLA(d, cfg.kv_quant_bits, curFlow());
+  const r=N.simulate(ops,mult,cfg);
+  // cards
+  const feas = r.control_hz>=10 && r.avg_power_w<=30 && r.area_mm2<=60;
+  const cards=[
+    ["控制频率",r.control_hz.toFixed(1),"Hz",feas?"hz":"fail"],
+    ["端到端",r.e2e_latency_ms.toFixed(0),"ms/步",""],
+    ["decode",r.decode_ms_per_token.toFixed(1)+"/"+r.decode_tok_s.toFixed(0),"ms · tok/s",""],
+    ["面积",r.area_mm2.toFixed(1),"mm²",""],
+    ["功耗",r.avg_power_w.toFixed(1),"W (≤30)",r.avg_power_w<=30?"":"fail"],
+    ["能耗/tok",r.energy_per_token_mj.toFixed(1),"mJ",""],
+    ["峰值",r.peak_int8_tops.toFixed(0),"INT8 TOPS",""],
+    ["可行",feas?"✓":"✗","≥10Hz·≤30W·≤60mm²",feas?"pass":"fail"],
+  ];
+  document.getElementById("cards").innerHTML = cards.map(([k,v,u,cl])=>
+    `<div class="card ${cl}"><div class="k">${k}</div><div class="v">${v}</div><div class="u">${u}</div></div>`).join("");
+  // stages
+  const stageTotal={}, order=["vit","connector","prefill","decode","action"];
+  let e2e=0; for(const s of order){ if(s in r.stage_time_ms){ stageTotal[s]=r.stage_time_ms[s]*(mult[s]||1); e2e+=stageTotal[s]; } }
+  const mx=Math.max(...Object.values(stageTotal),1e-9);
+  document.getElementById("stages").innerHTML=order.filter(s=>s in stageTotal).map(s=>{
+    const t=stageTotal[s]; return `<div class="bar"><span class="nm">${s} ×${mult[s]||1}</span>
+      <span class="tr"><span class="fl" style="width:${100*t/mx}%;background:${STAGE_COLORS[s]}"></span></span>
+      <span class="lb">${t.toFixed(1)} ms</span></div>`;}).join("");
+  // roofs
+  const rt=Object.entries(r.bound_hist_ms).sort((a,b)=>b[1]-a[1]); const rtot=rt.reduce((a,x)=>a+x[1],0)||1;
+  document.getElementById("roofs").innerHTML=rt.map(([k,v])=>`<div class="bar"><span class="nm">${k}</span>
+      <span class="tr"><span class="fl" style="width:${100*v/rtot}%;background:${ROOF_COLORS[k]||"#888"}"></span></span>
+      <span class="lb">${(100*v/rtot).toFixed(0)}%</span></div>`).join("");
+  const topRoof=rt[0]?rt[0][0]:"-";
+  document.getElementById("roofnote").textContent=
+    topRoof=="dram"?"带宽受限:加 DRAM 带宽 / 减 decode token / KV 量化。":
+    topRoof=="compute"?"算力受限:加大阵列或提时钟 (注意面积/功耗)。":"";
+  // energy
+  const eb=r.decode_energy_breakdown_mj, etot=Math.max(eb.dram+eb.mac+Math.max(eb.sram,0),1e-9);
+  document.getElementById("energy").innerHTML=[["DRAM",eb.dram,"#e2655a"],["MAC",eb.mac,"#5b8cff"],["SRAM",Math.max(eb.sram,0),"#2fbf8f"]]
+    .map(([k,v,c])=>`<div class="bar"><span class="nm">${k}</span>
+      <span class="tr"><span class="fl" style="width:${100*v/etot}%;background:${c}"></span></span>
+      <span class="lb">${v.toFixed(2)} mJ</span></div>`).join("");
+  // op table
+  document.getElementById("opcount").textContent=r.per_op.length;
+  document.getElementById("optbody").innerHTML=r.per_op.map(o=>{
+    const ms=o.time_s*1e3;
+    return `<tr><td>${o.op_id}</td><td>${o.stage}</td><td>${o.type}</td>
+      <td>${o.M}</td><td>${o.N}</td><td>${o.K}</td>
+      <td>${(o.macs/1e6).toFixed(1)}</td>
+      <td>${(N.weightBytes(o)/1e6).toFixed(2)}</td>
+      <td>${ms<0.01?ms.toExponential(1):ms.toFixed(2)}×${o.count}</td>
+      <td><span class="tag b-${o.bound}">${o.bound}</span></td></tr>`;
+  }).join("");
+}
+buildControls(); recompute();
+</script>
+</body>
+</html>

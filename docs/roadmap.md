@@ -20,6 +20,10 @@ mirroring the companion h264_by_claude_code / jpeg_by_claude_code ASIC flow.
 - **设计是带宽/延迟受限,非功耗受限**(6.5W ≪ 30W,余量未用)。
 - **8 个自回归 decode token 是主导成本**(每 token 流 2.6GB)→ 强烈倾向 flow-matching 动作专家而非长自回归动作 token decode;这是 VLA "口味"对 NPU 的最大杠杆。
 
+## Web 仿真器
+
+`web/index.html` + `web/npusim_model.js`:纯客户端单页(无后端/依赖/可离线),roofline 模型 JS 移植与 Python **逐数吻合**(baseline 271.8ms/3.68Hz、recommended 89.4ms/11.2Hz)。可选模型(3B/7B/1B)、实时拖超参、看各阶段延迟/瓶颈/能耗/**算子级仿真表**。node 交叉校验 `web/npusim_model.js`。
+
 ## 待办/下一步
 
 - 扫 n_decode_tokens(flow-only vs 自回归)与 decode_batch(并行采样)的影响。
