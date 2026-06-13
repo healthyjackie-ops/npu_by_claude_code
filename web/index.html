@@ -17,9 +17,9 @@
   .main{padding:16px 20px;overflow:auto}
   .grp{margin-bottom:18px}
   .grp h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 8px;font-weight:600}
-  .row{display:flex;align-items:center;gap:8px;margin:7px 0}
-  .row{cursor:help}
-  .row label{flex:0 0 116px;color:var(--mut);font-size:12px}
+  .row{margin:10px 0;cursor:help}
+  .row .top{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .row label{color:var(--mut);font-size:12px;line-height:1.3}
   .qm{display:inline-block;width:13px;height:13px;line-height:13px;text-align:center;
       border-radius:50%;background:var(--line);color:var(--mut);font-size:9px;vertical-align:1px}
   [title]{cursor:help}
@@ -27,8 +27,8 @@
   .rl-roof{stroke-width:2;fill:none} .rl-pt{stroke:#0b0d11;stroke-width:.5}
   .rl-ax{stroke:var(--line);stroke-width:1} .rl-txt{fill:var(--mut);font-size:10px}
   .rl-lbl{fill:var(--txt);font-size:11px}
-  .row input[type=range]{flex:1;accent-color:var(--acc)}
-  .row .val{flex:0 0 58px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+  .row input[type=range]{display:block;width:100%;accent-color:var(--acc);margin-top:3px}
+  .row .val{color:var(--txt);font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
   select,input[type=number]{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
         border-radius:6px;padding:6px 8px;font:inherit;width:100%}
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:18px}
@@ -64,6 +64,9 @@
   <div class="controls" id="controls"></div>
   <div class="main">
     <div class="cards" id="cards"></div>
+    <div class="panel"><h2 title="这颗 NPU 的组件与数据流。每个方块标注了它由哪些控件(旋钮)决定,方块里的数字随左侧滑块实时更新。">NPU 组件架构 — 控件 ↔ 部件对应(数字随滑块变) <span class="qm">?</span></h2>
+      <div id="arch"></div>
+      <div class="note">数据流:DRAM →(DMA/KV 引擎)→ 片上 SRAM →{Tensor 脉动阵列 / 向量单元}。<b style="color:#5b8cff">蓝路径</b>=算力受限(ViT/prefill 的大矩阵乘走 Tensor 阵列);<b style="color:#e2655a">红路径</b>=带宽受限(decode 每 token 要从 DRAM 流过约 2.6GB 权重喂向量单元)。每个方块下方灰字标的就是控制它的滑块。</div></div>
     <div class="panel"><h2 title="经典 roofline:横轴=算术强度(每从 DRAM 读 1 字节能做多少次乘加),纵轴=可达算力。算子落在斜线上=被带宽卡,落在水平线上=被算力卡。">Roofline 图 — 每个算子卡在算力还是带宽? <span class="qm">?</span></h2>
       <div id="roofline"></div>
       <div class="note">斜线 = DRAM 带宽屋顶;水平线 = 算力屋顶(阵列/向量)。点越靠左下=越被带宽卡(decode);越靠右=被算力卡(prefill/视觉)。颜色按阶段。</div></div>
@@ -139,9 +142,9 @@ function buildControls(){
     h += `<div class="grp"><h3>${grp}</h3>`;
     for (const [key,label,[mn,mx,st],tip] of items){
       const v = key.startsWith("__") ? (wl[key]!=null?wl[key]:defWL(key)) : cfg[key];
-      h += `<div class="row" title="${tip||""}"><label>${label} <span class="qm">?</span></label>
-        <input type="range" data-k="${key}" min="${mn}" max="${mx}" step="${st}" value="${v}" title="${tip||""}">
-        <span class="val" id="v_${key}">${fmt(v)}</span></div>`;
+      h += `<div class="row" title="${tip||""}">
+        <div class="top"><label>${label} <span class="qm">?</span></label><span class="val" id="v_${key}">${fmt(v)}</span></div>
+        <input type="range" data-k="${key}" min="${mn}" max="${mx}" step="${st}" value="${v}" title="${tip||""}"></div>`;
     }
     h += `</div>`;
   }
@@ -209,6 +212,62 @@ function drawRoofline(r, c){
   document.getElementById("roofline").innerHTML=s;
 }
 
+// ---- NPU component architecture, with live values + which knobs size each block ----
+function drawArch(c, r){
+  const W=660, H=300;
+  const util  = (+c.dram_bw_util_decode).toFixed(2);
+  const sramMB= (c.scratchpad_kb/1024).toFixed(1);
+  const tPeakT= (c.tensor_array_dim*c.tensor_array_dim*c.tensor_clock_ghz/1000).toFixed(1); // TMAC/s
+  const vPeakG= (c.vector_lanes*c.vector_dot_len*c.vector_clock_ghz).toFixed(0);            // GMAC/s
+  const resPct= Math.round(c.resident_weight_frac*100);
+  const pfMs  = (r.stage_time_ms.prefill||0).toFixed(1);
+  const vitMs = (r.stage_time_ms.vit||0).toFixed(1);
+  const decMs = r.decode_ms_per_token.toFixed(2);
+  const GREY="#8b93a7", RED="#e2655a", BLUE="#5b8cff", GREEN="#2fbf8f";
+  function box(x,y,w,h,stroke,fill,title,lines){
+    let g=`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9" fill="${fill}" stroke="${stroke}" stroke-width="1.6"/>`;
+    g+=`<text x="${x+w/2}" y="${y+19}" text-anchor="middle" style="fill:${stroke};font-size:12.5px;font-weight:700">${title}</text>`;
+    let yy=y+36;
+    for(const [t,kind] of lines){
+      const st = kind=="knob" ? "fill:var(--mut);font-size:9px"
+               : kind=="big"  ? "fill:var(--txt);font-size:12px;font-weight:600"
+               :                "fill:var(--mut);font-size:10px";
+      g+=`<text x="${x+w/2}" y="${yy}" text-anchor="middle" style="${st}">${t}</text>`;
+      yy += kind=="knob"?13:15;
+    }
+    return g;
+  }
+  const arrow=(x1,y1,x2,y2,col,w)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${col}" stroke-width="${w||2.6}" marker-end="url(#ah-${col})"/>`;
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:660px">`;
+  s+=`<defs>`+[GREY,RED,BLUE].map(col=>
+    `<marker id="ah-${col}" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="${col}"/></marker>`).join("")+`</defs>`;
+  // blocks (dataflow left -> right): DRAM -> DMA/KV -> SRAM -> {Tensor, Vector}
+  s+=box(10,104,120,96, RED,  "rgba(226,101,90,.07)",  "LPDDR5X DRAM",
+    [[`${c.dram_bw_gbps} GB/s ×${util}`,"big"],["片外内存 · decode 瓶颈","sub"],["旋钮: DRAM 带宽 / 利用率","knob"]]);
+  s+=box(168,104,120,96, GREY, "var(--panel2)",        "DMA + KV 引擎",
+    [[`KV ${c.kv_quant_bits}-bit`,"big"],["双缓冲流式取 权重/KV","sub"],["旋钮: KV cache 位宽","knob"]]);
+  s+=box(326,104,120,96, GREY, "var(--panel2)",        "片上 SRAM 暂存",
+    [[`${sramMB} MB`,"big"],[`常驻热权重 ${resPct}%`,"sub"],["旋钮: 片上 SRAM / 常驻权重比","knob"]]);
+  s+=box(486,14,164,96,  BLUE, "rgba(91,140,255,.07)",  "Tensor 脉动阵列",
+    [[`${c.tensor_array_dim}×${c.tensor_array_dim} @ ${(+c.tensor_clock_ghz).toFixed(1)}GHz`,"big"],
+     [`≈ ${tPeakT} TMAC/s · 跑 ViT/prefill`,"sub"],[`当前 ViT ${vitMs} + prefill ${pfMs} ms`,"sub"],
+     ["旋钮: 阵列边 N / 时钟 / GEMM 利用率","knob"]]);
+  s+=box(486,194,164,96, GREEN,"rgba(47,191,143,.07)",  "向量单元 + SFU",
+    [[`${c.vector_lanes}×${c.vector_dot_len} lane`,"big"],
+     [`≈ ${vPeakG} GMAC/s · 跑 decode/softmax`,"sub"],[`当前 decode ${decMs} ms/tok`,"sub"],
+     ["旋钮: 向量 lane / 点积长 / decode batch","knob"]]);
+  // arrows: shared feed (grey), then compute path (blue) vs decode path (red)
+  s+=arrow(130,152,166,152, GREY);
+  s+=arrow(288,152,324,152, GREY);
+  s+=arrow(446,138,484,86,  BLUE);   // SRAM -> Tensor : ViT/prefill, compute-bound
+  s+=arrow(446,166,484,232, RED);    // SRAM -> Vector : decode, bandwidth-bound
+  // path labels
+  s+=`<text x="455" y="96"  style="fill:${BLUE};font-size:9px">prefill/ViT</text>`;
+  s+=`<text x="455" y="210" style="fill:${RED};font-size:9px">decode</text>`;
+  s+=`</svg>`;
+  document.getElementById("arch").innerHTML=s;
+}
+
 function recompute(){
   const d=curDims();
   const {ops,mult}=N.buildVLA(d, cfg.kv_quant_bits, curFlow(), cfg.decode_batch);
@@ -227,6 +286,7 @@ function recompute(){
   ];
   document.getElementById("cards").innerHTML = cards.map(([k,v,u,cl])=>
     `<div class="card ${cl}" title="${CARD_TIPS[k]||''}"><div class="k">${k}</div><div class="v">${v}</div><div class="u">${u}</div></div>`).join("");
+  drawArch(cfg, r);
   drawRoofline(r, cfg);
   // stages
   const stageTotal={}, order=["vit","connector","prefill","decode","action"];
