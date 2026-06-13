@@ -1,0 +1,40 @@
+{
+  "_comment": "HV-1+ baseline hyperparameters + 7nm/0.7V coefficients (W0 spec). Every key is a sweepable knob.",
+
+  "tensor_array_dim": 128,
+  "tensor_clock_ghz": 1.0,
+  "vector_lanes": 512,
+  "vector_dot_len": 4,
+  "vector_clock_ghz": 1.0,
+  "tensor_fold_groups": 1,
+
+  "scratchpad_kb": 4096,
+  "scratchpad_banks": 24,
+  "sram_partition_decode_frac": 0.5,
+  "bytes_per_bank_per_cyc": 16,
+
+  "dram_bw_gbps": 136.0,
+  "dram_bw_util_decode": 0.85,
+  "stream_tile_kb": 256,
+  "tile_buf": 2,
+  "dma_outstanding": 16,
+
+  "decode_batch": 1,
+  "kv_quant_bits": 8,
+  "kv_groups_gqa": 5,
+  "flow_expert_steps": 8,
+
+  "util_gemm": 0.85,
+  "sfu_ratio": 0.125,
+  "accum_width_bits": 32,
+  "resident_weight_frac": 0.1,
+
+  "mac_pj": 0.18,
+  "sram_rd_pj_per_byte": 0.35,
+  "sram_wr_pj_per_byte": 0.42,
+  "dram_pj_per_byte": 8.0,
+  "per_mac_um2": 430.0,
+  "sram_um2_per_kb": 410.0,
+  "fixed_area_overhead_frac": 0.20,
+  "leakage_w_per_mm2": 0.05
+}
