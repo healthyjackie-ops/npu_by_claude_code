@@ -11,7 +11,7 @@
     tensor_fold_groups: 1,
     scratchpad_kb: 4096, scratchpad_banks: 24, sram_partition_decode_frac: 0.5,
     bytes_per_bank_per_cyc: 16,
-    dram_bw_gbps: 136.0, dram_bw_util_decode: 0.85, stream_tile_kb: 256,
+    dram_bw_gbps: 136.0, dram_bw_util_decode: 0.85, dram_bw_util_compute: 0.90, stream_tile_kb: 256,
     tile_buf: 2, dma_outstanding: 16,
     decode_batch: 1, kv_quant_bits: 8, kv_groups_gqa: 5, flow_expert_steps: 8,
     util_gemm: 0.85, sfu_ratio: 0.125, accum_width_bits: 32,
@@ -69,7 +69,8 @@
   }
 
   // operator-graph builder (port of workload_vla.build_vla)
-  function buildVLA(d, kvBits, flowSteps) {
+  function buildVLA(d, kvBits, flowSteps, decodeBatch) {
+    const B = Math.max(1, decodeBatch || 1);
     const ops = [];
     const op = (id, stage, type, o) => ops.push(Object.assign(
       { op_id: id, stage, type, M: 1, N: 1, K: 1, heads: 1, count: 1,
@@ -90,7 +91,7 @@
     // connector
     op("conn.proj", "connector", "gemm", { M: d.vit_patches, K: H, N: d.conn_out, count: 2 });
     // LLM prefill
-    const Hl = d.llm_hidden, qn = d.q_heads * d.head_dim, kvn = d.kv_heads * d.head_dim, P = d.prompt_len;
+    const Hl = d.llm_hidden, qn = d.q_heads * d.head_dim, kvn = d.kv_heads * d.head_dim, P = d.vit_patches + d.prompt_len;
     op("pf.q", "prefill", "gemm", { M: P, K: Hl, N: qn, count: d.llm_layers });
     op("pf.kv", "prefill", "gemm", { M: P, K: Hl, N: 2 * kvn, count: d.llm_layers });
     op("pf.qk", "prefill", "attn_score", { M: P, K: d.head_dim, N: P, heads: d.q_heads, count: d.llm_layers, has_weights: false });
@@ -105,18 +106,18 @@
     // LLM decode (one token; stage x n_decode_tokens)
     const kvb = Math.floor((kvBits + 7) / 8);
     const kvRead = 2 * d.seq_len * d.kv_heads * d.head_dim * kvb;
-    op("dec.q", "decode", "gemv", { M: 1, K: Hl, N: qn, count: d.llm_layers, reuse: "stream_once" });
-    op("dec.kv", "decode", "gemv", { M: 1, K: Hl, N: 2 * kvn, count: d.llm_layers, reuse: "stream_once" });
-    op("dec.qk", "decode", "attn_score", { M: 1, K: d.head_dim, N: d.seq_len, heads: d.q_heads, count: d.llm_layers, has_weights: false, kv_read_bytes: (kvRead / 2) | 0, reuse: "stream_once" });
-    op("dec.softmax", "decode", "softmax", { M: 1, N: d.seq_len, heads: d.q_heads, count: d.llm_layers, has_weights: false });
-    op("dec.av", "decode", "attn_av", { M: 1, K: d.seq_len, N: d.head_dim, heads: d.q_heads, count: d.llm_layers, has_weights: false, kv_read_bytes: (kvRead / 2) | 0, reuse: "stream_once" });
-    op("dec.o", "decode", "gemv", { M: 1, K: qn, N: Hl, count: d.llm_layers, reuse: "stream_once" });
-    op("dec.gate", "decode", "gemv", { M: 1, K: Hl, N: d.llm_mlp, count: d.llm_layers, reuse: "stream_once" });
-    op("dec.up", "decode", "gemv", { M: 1, K: Hl, N: d.llm_mlp, count: d.llm_layers, reuse: "stream_once" });
-    op("dec.silu", "decode", "act", { M: 1, N: d.llm_mlp, count: d.llm_layers, has_weights: false });
-    op("dec.down", "decode", "gemv", { M: 1, K: d.llm_mlp, N: Hl, count: d.llm_layers, reuse: "stream_once" });
-    op("dec.norm", "decode", "norm", { M: 1, N: Hl, count: 2 * d.llm_layers, has_weights: false });
-    op("dec.lm_head", "decode", "gemv", { M: 1, K: Hl, N: d.vocab, count: 1, reuse: "stream_once" });
+    op("dec.q", "decode", "gemv", { M: B, K: Hl, N: qn, count: d.llm_layers, reuse: "stream_once" });
+    op("dec.kv", "decode", "gemv", { M: B, K: Hl, N: 2 * kvn, count: d.llm_layers, reuse: "stream_once" });
+    op("dec.qk", "decode", "attn_score", { M: B, K: d.head_dim, N: d.seq_len, heads: d.q_heads, count: d.llm_layers, has_weights: false, kv_read_bytes: ((kvRead / 2) | 0) * B, reuse: "stream_once" });
+    op("dec.softmax", "decode", "softmax", { M: B, N: d.seq_len, heads: d.q_heads, count: d.llm_layers, has_weights: false });
+    op("dec.av", "decode", "attn_av", { M: B, K: d.seq_len, N: d.head_dim, heads: d.q_heads, count: d.llm_layers, has_weights: false, kv_read_bytes: ((kvRead / 2) | 0) * B, reuse: "stream_once" });
+    op("dec.o", "decode", "gemv", { M: B, K: qn, N: Hl, count: d.llm_layers, reuse: "stream_once" });
+    op("dec.gate", "decode", "gemv", { M: B, K: Hl, N: d.llm_mlp, count: d.llm_layers, reuse: "stream_once" });
+    op("dec.up", "decode", "gemv", { M: B, K: Hl, N: d.llm_mlp, count: d.llm_layers, reuse: "stream_once" });
+    op("dec.silu", "decode", "act", { M: B, N: d.llm_mlp, count: d.llm_layers, has_weights: false });
+    op("dec.down", "decode", "gemv", { M: B, K: d.llm_mlp, N: Hl, count: d.llm_layers, reuse: "stream_once" });
+    op("dec.norm", "decode", "norm", { M: B, N: Hl, count: 2 * d.llm_layers, has_weights: false });
+    op("dec.lm_head", "decode", "gemv", { M: B, K: Hl, N: d.vocab, count: 1, reuse: "stream_once" });
     // action expert (flow DiT; stage x flow_steps)
     if (d.act_blocks > 0) {
       const A = d.act_hidden, Na = d.act_tokens, ah = (A / 8) | 0;
@@ -163,34 +164,36 @@
     } else {
       compute_t = m / vectorEff(o, c); bound = "compute";
     }
-    // DRAM roof
-    let wb = wB;
-    if (o.resident) wb = 0;
-    else if (o.reuse === "stream_once") {
-      wb = Math.floor(wb * (1 - c.resident_weight_frac));
-      wb = Math.floor(wb / Math.max(1, c.decode_batch));
-    }
+    // DRAM roof (weights fetched once; batch raises M/compute, not traffic)
+    const stream = o.reuse === "stream_once";
+    let wb = o.resident ? 0 : wB;
+    if (stream) wb = Math.floor(wb * (1 - c.resident_weight_frac));
     const dramBytes = wb + o.kv_read_bytes;
-    const effBw = c.dram_bw_gbps * 1e9 * c.dram_bw_util_decode;
-    const dram_t = dramBytes / Math.max(effBw, 1);
-    // on-chip roof
-    const onchipBytes = aIn + aOut;
+    const util = stream ? c.dram_bw_util_decode
+      : (c.dram_bw_util_compute != null ? c.dram_bw_util_compute : c.dram_bw_util_decode);
+    const dram_t = dramBytes / Math.max(c.dram_bw_gbps * 1e9 * util, 1);
+    // on-chip roof (acts always; weights staged for tensor GEMM / streaming)
+    let onchipBytes = aIn + aOut;
+    if (useTensor && !o.resident && !stream) onchipBytes += wB;
     const onchipBw = c.scratchpad_banks * c.bytes_per_bank_per_cyc * c.tensor_clock_ghz * 1e9;
     const onchip_t = onchipBytes / Math.max(onchipBw, 1);
     let t = Math.max(compute_t, dram_t, onchip_t);
-    if (t === dram_t && dram_t > compute_t && dram_t > onchip_t) bound = "dram";
-    else if (t === onchip_t && onchip_t > compute_t) bound = "onchip";
-    // energy
-    let sramBytes = aIn + aOut;
-    if (o.reuse !== "stream_once") sramBytes += wB;
-    const energy = (m * c.mac_pj + sramBytes * c.sram_rd_pj_per_byte
-      + aOut * c.sram_wr_pj_per_byte + dramBytes * c.dram_pj_per_byte) * 1e-12;
+    if (!SFU.has(o.type)) {
+      if (t === dram_t && dram_t >= compute_t && dram_t >= onchip_t) bound = "dram";
+      else if (t === onchip_t && onchip_t > compute_t) bound = "onchip";
+    }
+    // energy: DRAM->SRAM fill (write) + SRAM->PE (read) + MAC
+    const stagedW = o.resident ? 0 : wB;
+    const sramRd = aIn + stagedW, sramWr = aOut + stagedW;
+    const energy = (m * c.mac_pj + sramRd * c.sram_rd_pj_per_byte
+      + sramWr * c.sram_wr_pj_per_byte + dramBytes * c.dram_pj_per_byte) * 1e-12;
     return { op_id: o.op_id, stage: o.stage, type: o.type, M: o.M, N: o.N, K: o.K,
       time_s: t, bound, macs: m, dram_bytes: dramBytes, energy_j: energy, count: o.count };
   }
 
   function simulate(ops, mult, c) {
     const per = ops.map(o => simOp(o, c));
+    const batch = Math.max(1, c.decode_batch || 1);
     const stageTime = {}, stageEnergy = {}, boundHist = {};
     for (const r of per) {
       stageTime[r.stage] = (stageTime[r.stage] || 0) + r.time_s * r.count;
@@ -199,29 +202,33 @@
     }
     let e2e = 0, e2eE = 0;
     for (const s in stageTime) { e2e += stageTime[s] * (mult[s] || 1); e2eE += stageEnergy[s] * (mult[s] || 1); }
-    const decT = stageTime.decode || 0;
     const dim = c.tensor_array_dim;
     const tensorArea = dim * dim * c.per_mac_um2;
     const vecArea = c.vector_lanes * c.vector_dot_len * c.per_mac_um2 * 1.3;
     const sramArea = c.scratchpad_kb * c.sram_um2_per_kb;
     const areaMm2 = (tensorArea + vecArea + sramArea) * (1 + c.fixed_area_overhead_frac) / 1e6;
-    let avgPow = e2e > 0 ? e2eE / e2e : 0;
-    avgPow += areaMm2 * c.leakage_w_per_mm2;
+    const leakW = areaMm2 * c.leakage_w_per_mm2;
+    e2eE += leakW * e2e;                              // leakage as an energy term
+    const avgPow = e2e > 0 ? e2eE / e2e : 0;
+    let peakPow = 0;                                  // worst sequential stage
+    for (const s in stageTime) if (stageTime[s] > 0)
+      peakPow = Math.max(peakPow, stageEnergy[s] / stageTime[s] + leakW);
+    const decStep = stageTime.decode || 0, decStepE = stageEnergy.decode || 0;
     const dec = per.filter(r => r.stage === "decode");
     const decDram = dec.reduce((a, r) => a + r.dram_bytes * c.dram_pj_per_byte * 1e-12 * r.count, 0);
     const decMac = dec.reduce((a, r) => a + r.macs * c.mac_pj * 1e-12 * r.count, 0);
-    const decE = dec.reduce((a, r) => a + r.energy_j * r.count, 0);
     return {
       stage_time_ms: Object.fromEntries(Object.entries(stageTime).map(([k, v]) => [k, v * 1e3])),
       stage_mult: mult,
       e2e_latency_ms: e2e * 1e3,
       control_hz: e2e > 0 ? 1 / e2e : 0,
-      decode_ms_per_token: decT * 1e3,
-      decode_tok_s: decT > 0 ? 1 / decT : 0,
-      energy_per_token_mj: decE * 1e3,
-      decode_energy_breakdown_mj: { dram: decDram * 1e3, mac: decMac * 1e3, sram: (decE - decDram - decMac) * 1e3 },
+      decode_ms_per_token: (decStep / batch) * 1e3,
+      decode_tok_s: decStep > 0 ? batch / decStep : 0,
+      energy_per_token_mj: (decStepE / batch) * 1e3,
+      decode_energy_breakdown_mj: { dram: decDram / batch * 1e3, mac: decMac / batch * 1e3,
+        sram: (decStepE - decDram - decMac) / batch * 1e3 },
       e2e_energy_mj: e2eE * 1e3,
-      avg_power_w: avgPow,
+      avg_power_w: avgPow, peak_power_w: peakPow,
       peak_int8_tops: 2 * dim * dim * c.tensor_clock_ghz * 1e9 / 1e12,
       area_mm2: areaMm2,
       area_breakdown_mm2: { tensor: tensorArea / 1e6, vector: vecArea / 1e6, sram: sramArea / 1e6 },

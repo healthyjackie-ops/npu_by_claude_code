@@ -143,7 +143,7 @@ const ROOF_COLORS={compute:"#5b8cff",dram:"#e2655a",onchip:"#e0a83e",sfu:"#2fbf8
 
 function recompute(){
   const d=curDims();
-  const {ops,mult}=N.buildVLA(d, cfg.kv_quant_bits, curFlow());
+  const {ops,mult}=N.buildVLA(d, cfg.kv_quant_bits, curFlow(), cfg.decode_batch);
   const r=N.simulate(ops,mult,cfg);
   // cards
   const feas = r.control_hz>=10 && r.avg_power_w<=30 && r.area_mm2<=60;
@@ -152,7 +152,7 @@ function recompute(){
     ["端到端",r.e2e_latency_ms.toFixed(0),"ms/步",""],
     ["decode",r.decode_ms_per_token.toFixed(1)+"/"+r.decode_tok_s.toFixed(0),"ms · tok/s",""],
     ["面积",r.area_mm2.toFixed(1),"mm²",""],
-    ["功耗",r.avg_power_w.toFixed(1),"W (≤30)",r.avg_power_w<=30?"":"fail"],
+    ["功耗 avg/peak",r.avg_power_w.toFixed(1)+"/"+r.peak_power_w.toFixed(1),"W (≤30)",r.peak_power_w<=30?"":"fail"],
     ["能耗/tok",r.energy_per_token_mj.toFixed(1),"mJ",""],
     ["峰值",r.peak_int8_tops.toFixed(0),"INT8 TOPS",""],
     ["可行",feas?"✓":"✗","≥10Hz·≤30W·≤60mm²",feas?"pass":"fail"],

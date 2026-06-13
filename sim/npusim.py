@@ -40,15 +40,38 @@ def _cast(v):
     return v
 
 
+import math
+INT_KEYS = {"tensor_array_dim", "vector_lanes", "vector_dot_len",
+            "tensor_fold_groups", "scratchpad_kb", "scratchpad_banks",
+            "bytes_per_bank_per_cyc", "stream_tile_kb", "tile_buf",
+            "dma_outstanding", "decode_batch", "kv_quant_bits",
+            "kv_groups_gqa", "flow_expert_steps", "accum_width_bits"}
+
+
 def load_cfg(path, overrides):
-    c = roofline.load_config(path)
+    try:
+        c = roofline.load_config(path)
+    except FileNotFoundError:
+        sys.exit(f"config not found: {path}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"bad config JSON {path}: {e}")
     for kv in overrides or []:
         if "=" not in kv:
             sys.exit(f"bad -D '{kv}', expected key=value")
         k, v = kv.split("=", 1)
         if k not in c:
             sys.exit(f"unknown config key '{k}'. keys: {', '.join(sorted(c))}")
-        c[k] = _cast(v)
+        val = _cast(v)
+        if isinstance(c[k], (int, float)) and not isinstance(val, (int, float)):
+            sys.exit(f"'{k}' expects a number, got '{v}'")
+        if isinstance(val, float) and not math.isfinite(val):
+            sys.exit(f"'{k}'={v} must be finite")
+        if k in INT_KEYS and isinstance(val, float) and val != int(val):
+            sys.exit(f"'{k}' must be an integer, got {v}")
+        if isinstance(val, (int, float)) and k not in ("fixed_area_overhead_frac",
+                "resident_weight_frac", "sram_partition_decode_frac") and val <= 0:
+            sys.exit(f"'{k}'={v} must be > 0")
+        c[k] = int(val) if k in INT_KEYS else val
     return c
 
 
@@ -66,7 +89,8 @@ def make_dims(args):
 def run_point(c, d, flow=None):
     ops, mult = build_vla(d, kv_quant_bits=c["kv_quant_bits"],
                           flow_steps=int(flow if flow is not None
-                                         else c["flow_expert_steps"]))
+                                         else c["flow_expert_steps"]),
+                          decode_batch=int(c["decode_batch"]))
     return roofline.simulate(ops, mult, c)
 
 
@@ -97,7 +121,8 @@ def cmd_run(args):
           f"(DRAM {r['decode_energy_breakdown_mj']['dram']:.2f}/"
           f"SRAM {r['decode_energy_breakdown_mj']['sram']:.2f}/"
           f"MAC {r['decode_energy_breakdown_mj']['mac']:.2f})")
-    print(f"avg pow : {r['avg_power_w']:.2f} W")
+    print(f"power   : avg {r['avg_power_w']:.2f} W | peak {r['peak_power_w']:.2f} W "
+          f"(envelope 10-30 W)")
     tot = sum(r['bound_hist_ms'].values()) or 1
     print("roof%   : " + "  ".join(f"{k} {100*v/tot:.0f}%"
           for k, v in sorted(r['bound_hist_ms'].items(), key=lambda x: -x[1])))
@@ -124,6 +149,9 @@ def cmd_sweep(args):
     feas = sorted([x for x in rows if x[2]], key=lambda x: -x[1]["control_hz"])
     print(f"swept {len(rows)} pts; {len(feas)} feasible "
           f"(area<={args.area} power<={args.power} lat<={args.latency}ms)\n")
+    if not feas:
+        print("NO FEASIBLE POINTS — showing closest-by-e2e (constraints "
+              "VIOLATED; levers: BW / fewer decode tokens / flow head):\n")
     hdr = f"{'arr':>4} {'clk':>4} {'BW':>4} {'SRAM':>5} | {'Hz':>5} {'e2e':>6} {'mm2':>5} {'W':>5}"
     print(hdr); print("-" * len(hdr))
     for ov, r, _ in (feas or sorted(rows, key=lambda x: x[1]["e2e_latency_ms"]))[:12]:
@@ -175,19 +203,30 @@ def cmd_report(args):
 
 
 def cmd_selftest(args):
-    """Validate the model against the analytic decode DRAM roof + invariants."""
-    c = roofline.load_config(DEFAULT_CFG)
-    d = VLADims()
-    r = run_point(c, d)
-    fails = []
+    """Validate the model against the analytic decode DRAM roof + invariants.
 
-    # 1) decode must be DRAM-bound at the analytic roof (within 5%)
-    w = 2.59e9 * (1 - c["resident_weight_frac"])   # weights/token after resident
+    Honors --config/-D so it validates the design point you actually run, not
+    a hardcoded baseline. The analytic decode weight bytes are summed from the
+    built op list (not a magic constant), so it can't silently drift.
+    """
+    c = load_cfg(args.config, args.D)
+    d = make_dims(args)
+    ops, mult = build_vla(d, kv_quant_bits=c["kv_quant_bits"],
+                          flow_steps=int(c["flow_expert_steps"]),
+                          decode_batch=int(c["decode_batch"]))
+    r = roofline.simulate(ops, mult, c)
+    fails = []
+    batch = max(1, int(c["decode_batch"]))
+
+    # 1) decode matches the analytic DRAM roof (within 5%), weight bytes summed
+    #    from the actual decode ops (stream_once, minus resident frac).
+    w = sum(o.weight_bytes * o.count for o in ops if o.stage == "decode"
+            and o.reuse_class == "stream_once") * (1 - c["resident_weight_frac"])
     bw = c["dram_bw_gbps"] * 1e9 * c["dram_bw_util_decode"]
-    analytic_ms = w / bw * 1e3
+    analytic_ms = (w / bw) / batch * 1e3
     got = r["decode_ms_per_token"]
     err = abs(got - analytic_ms) / analytic_ms
-    ok = err < 0.10
+    ok = err < 0.05
     fails += [] if ok else [f"decode roof: got {got:.1f}ms vs analytic {analytic_ms:.1f}ms ({err*100:.0f}%)"]
     print(f"[{'PASS' if ok else 'FAIL'}] decode DRAM roof: {got:.1f} ms/tok "
           f"vs analytic {analytic_ms:.1f} ms ({err*100:.0f}% err)")
@@ -223,6 +262,23 @@ def cmd_selftest(args):
     print(f"[{'PASS' if ok5 else 'FAIL'}] area grows with array: "
           f"{[round(p[1],1) for p in aa]} mm2")
 
+    # 6) decode NOT on the systolic tensor core: decode time must be flat
+    #    w.r.t. tensor_array_dim. (The earlier bug routed M=1 decode attn to
+    #    the array, where the fill factor made array size matter and decode
+    #    ballooned. Flatness here is the regression guard.)
+    ta = _sens(c, d, "tensor_array_dim", [128, 192, 256],
+               getter=lambda r: r["decode_ms_per_token"])
+    routed = abs(ta[0][1] - ta[2][1]) < 1e-6
+    fails += [] if routed else [f"decode varies with array (on tensor core?): {ta}"]
+    print(f"[{'PASS' if routed else 'FAIL'}] decode off systolic core "
+          f"(flat w/ array: {[round(p[1],2) for p in ta]})")
+
+    # 7) peak power >= avg power and both > 0
+    okp = r["peak_power_w"] >= r["avg_power_w"] > 0
+    fails += [] if okp else [f"peak<avg: {r['peak_power_w']:.2f}<{r['avg_power_w']:.2f}"]
+    print(f"[{'PASS' if okp else 'FAIL'}] peak {r['peak_power_w']:.2f}W >= "
+          f"avg {r['avg_power_w']:.2f}W")
+
     print(f"\n{'ALL PASS' if not fails else 'FAILURES: ' + '; '.join(fails)}")
     return 0 if not fails else 1
 
@@ -256,7 +312,7 @@ def main():
     common(rp); rp.set_defaults(fn=cmd_report)
 
     st = sub.add_parser("selftest", help="validate model vs analytic roof")
-    st.set_defaults(fn=cmd_selftest)
+    common(st); st.set_defaults(fn=cmd_selftest)
 
     args = p.parse_args()
     sys.exit(args.fn(args))

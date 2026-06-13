@@ -47,8 +47,14 @@ class VLADims:
     n_decode_tokens: int = 8        # action tokens generated autoregressively
 
 
-def build_vla(d: VLADims, kv_quant_bits: int = 8, flow_steps: int = 8):
-    """Return (ops, stage_mult). ops grouped by stage; multipliers per stage."""
+def build_vla(d: VLADims, kv_quant_bits: int = 8, flow_steps: int = 8,
+              decode_batch: int = 1):
+    """Return (ops, stage_mult). ops grouped by stage; multipliers per stage.
+
+    decode_batch B>1 = B parallel action samples sharing one weight stream:
+    decode ops get M=B (compute + KV scale with B, weights fetched once); the
+    roofline divides the per-step decode metrics by B for per-token figures.
+    """
     ops = []
     H = d.vit_hidden
     hd = H // d.vit_heads
@@ -82,10 +88,12 @@ def build_vla(d: VLADims, kv_quant_bits: int = 8, flow_steps: int = 8):
                N=d.conn_out, count=2)]
 
     # ---- LLM prefill (per layer, x llm_layers) ----
+    # prefill ingests the image tokens (from the connector) PLUS the text
+    # prompt — together they form the KV context the decoder later reads.
     Hl = d.llm_hidden
     qn = d.q_heads * d.head_dim
     kvn = d.kv_heads * d.head_dim
-    P = d.prompt_len
+    P = d.vit_patches + d.prompt_len
     ops += [
         Op("pf.q", "prefill", GEMM, M=P, K=Hl, N=qn, count=d.llm_layers),
         Op("pf.kv", "prefill", GEMM, M=P, K=Hl, N=2 * kvn, count=d.llm_layers),
@@ -108,35 +116,38 @@ def build_vla(d: VLADims, kv_quant_bits: int = 8, flow_steps: int = 8):
            has_weights=False),
     ]
 
-    # ---- LLM decode (per layer, x llm_layers = ONE token; stage x n_decode) ----
+    # ---- LLM decode (per layer, x llm_layers = ONE step; stage x n_decode) ----
+    # M = decode_batch parallel samples share one weight stream; KV is
+    # per-sample so it scales with B.
+    B = max(1, int(decode_batch))
     kvb = (kv_quant_bits + 7) // 8
-    kv_read = 2 * d.seq_len * d.kv_heads * d.head_dim * kvb  # K+V cache, per layer per head-group
+    kv_read = 2 * d.seq_len * d.kv_heads * d.head_dim * kvb  # K+V, per layer
     ops += [
-        Op("dec.q", "decode", GEMV, M=1, K=Hl, N=qn, count=d.llm_layers,
+        Op("dec.q", "decode", GEMV, M=B, K=Hl, N=qn, count=d.llm_layers,
            reuse_class=STREAM_ONCE),
-        Op("dec.kv", "decode", GEMV, M=1, K=Hl, N=2 * kvn, count=d.llm_layers,
+        Op("dec.kv", "decode", GEMV, M=B, K=Hl, N=2 * kvn, count=d.llm_layers,
            reuse_class=STREAM_ONCE),
-        Op("dec.qk", "decode", ATTN_SCORE, M=1, K=d.head_dim, N=d.seq_len,
+        Op("dec.qk", "decode", ATTN_SCORE, M=B, K=d.head_dim, N=d.seq_len,
            heads=d.q_heads, count=d.llm_layers, has_weights=False,
-           kv_read_bytes=kv_read // 2, reuse_class=STREAM_ONCE),
-        Op("dec.softmax", "decode", SOFTMAX, M=1, N=d.seq_len, heads=d.q_heads,
+           kv_read_bytes=(kv_read // 2) * B, reuse_class=STREAM_ONCE),
+        Op("dec.softmax", "decode", SOFTMAX, M=B, N=d.seq_len, heads=d.q_heads,
            count=d.llm_layers, has_weights=False),
-        Op("dec.av", "decode", ATTN_AV, M=1, K=d.seq_len, N=d.head_dim,
+        Op("dec.av", "decode", ATTN_AV, M=B, K=d.seq_len, N=d.head_dim,
            heads=d.q_heads, count=d.llm_layers, has_weights=False,
-           kv_read_bytes=kv_read // 2, reuse_class=STREAM_ONCE),
-        Op("dec.o", "decode", GEMV, M=1, K=qn, N=Hl, count=d.llm_layers,
+           kv_read_bytes=(kv_read // 2) * B, reuse_class=STREAM_ONCE),
+        Op("dec.o", "decode", GEMV, M=B, K=qn, N=Hl, count=d.llm_layers,
            reuse_class=STREAM_ONCE),
-        Op("dec.gate", "decode", GEMV, M=1, K=Hl, N=d.llm_mlp,
+        Op("dec.gate", "decode", GEMV, M=B, K=Hl, N=d.llm_mlp,
            count=d.llm_layers, reuse_class=STREAM_ONCE),
-        Op("dec.up", "decode", GEMV, M=1, K=Hl, N=d.llm_mlp,
+        Op("dec.up", "decode", GEMV, M=B, K=Hl, N=d.llm_mlp,
            count=d.llm_layers, reuse_class=STREAM_ONCE),
-        Op("dec.silu", "decode", ACT, M=1, N=d.llm_mlp, count=d.llm_layers,
+        Op("dec.silu", "decode", ACT, M=B, N=d.llm_mlp, count=d.llm_layers,
            has_weights=False),
-        Op("dec.down", "decode", GEMV, M=1, K=d.llm_mlp, N=Hl,
+        Op("dec.down", "decode", GEMV, M=B, K=d.llm_mlp, N=Hl,
            count=d.llm_layers, reuse_class=STREAM_ONCE),
-        Op("dec.norm", "decode", NORM, M=1, N=Hl, count=2 * d.llm_layers,
+        Op("dec.norm", "decode", NORM, M=B, N=Hl, count=2 * d.llm_layers,
            has_weights=False),
-        Op("dec.lm_head", "decode", GEMV, M=1, K=Hl, N=d.vocab, count=1,
+        Op("dec.lm_head", "decode", GEMV, M=B, K=Hl, N=d.vocab, count=1,
            reuse_class=STREAM_ONCE),
     ]
 

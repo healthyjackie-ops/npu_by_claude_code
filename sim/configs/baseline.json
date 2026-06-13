@@ -15,6 +15,7 @@
 
   "dram_bw_gbps": 136.0,
   "dram_bw_util_decode": 0.85,
+  "dram_bw_util_compute": 0.90,
   "stream_tile_kb": 256,
   "tile_buf": 2,
   "dma_outstanding": 16,

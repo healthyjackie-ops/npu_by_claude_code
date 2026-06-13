@@ -29,7 +29,7 @@ hurts the 10–30 W envelope — rejected.
   decode when `decode_batch > 1`.
 - **Vector path**: many INT8 MAC lanes (default 512, dot-len 4) over the
   scratchpad — serves decode GEMV and the SFU (softmax/RMSNorm/GELU/SiLU/RoPE).
-  ~5 % of tensor-core area, over-serves the decode compute roof.
+  ~16 % of tensor-core area at the 128² baseline (512×4 lanes), and over-serves the decode compute roof by orders of magnitude.
 - **Unified banked scratchpad** (default 4 MB, 24 banks): prefill weight/act
   tiles + ViT activations resident; KV-cache window + hot resident weights for
   decode. `sram_partition_decode_frac` splits it.
